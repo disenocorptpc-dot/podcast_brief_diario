@@ -1,0 +1,122 @@
+name: Brief Diario → Podcast Telegram
+
+on:
+  # ── Disparador principal: issue abierto con el label "brief-diario" ──────────
+  issues:
+    types: [opened]
+
+  # ── Disparador manual para pruebas sin crear un issue real ───────────────────
+  workflow_dispatch:
+    inputs:
+      guion_prueba:
+        description: "Texto del guion de prueba (en español)"
+        required: false
+        default: |
+          Buenos días, Rufino. Son las siete de la mañana.
+          Hoy tienes dos reuniones importantes: a las diez con el equipo de diseño
+          y a las tres de la tarde con el cliente de Monterrey.
+          Tienes tres correos sin responder sobre el presupuesto de agosto.
+          Recuerda enviar el informe semanal antes de las cinco de la tarde.
+          Que tengas un excelente día.
+
+jobs:
+  generar-y-enviar-podcast:
+    # Filtrar por label solo cuando viene de un issue (no de workflow_dispatch)
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issues' &&
+       github.event.action == 'opened' &&
+       contains(github.event.issue.labels.*.name, 'brief-diario'))
+
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write   # Para cerrar el issue o comentar errores
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      # ── 2. Python + dependencias ─────────────────────────────────────────────
+      - name: Configurar Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar edge-tts
+        run: pip install --quiet -r scripts/requirements.txt
+
+      # ── 3. Preparar el guion ─────────────────────────────────────────────────
+      - name: Preparar variables de entorno
+        id: vars
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # Prueba manual: usar el input del dispatch
+            ISSUE_NUMBER="0"
+            # Escribir el guion a un archivo temporal para evitar problemas con caracteres especiales
+            cat << 'GUION_EOF' > /tmp/guion.txt
+          ${{ github.event.inputs.guion_prueba }}
+          GUION_EOF
+          else
+            # Disparado por issue real
+            ISSUE_NUMBER="${{ github.event.issue.number }}"
+            # Escribir el body del issue a un archivo temporal
+            cat << 'ISSUE_EOF' > /tmp/guion.txt
+          ${{ github.event.issue.body }}
+          ISSUE_EOF
+          fi
+
+          echo "ISSUE_NUMBER=${ISSUE_NUMBER}" >> "$GITHUB_ENV"
+          # Exportar el contenido del archivo como variable de entorno multilínea
+          {
+            echo "ISSUE_BODY<<BRIEF_DELIMITER"
+            cat /tmp/guion.txt
+            echo "BRIEF_DELIMITER"
+          } >> "$GITHUB_ENV"
+
+      # ── 4. Generar audio y enviar a Telegram ─────────────────────────────────
+      - name: Generar audio y enviar a Telegram
+        id: send
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scripts/brief_to_audio.py
+        # No usar continue-on-error aquí; queremos capturar el exit code manualmente
+
+      # ── 5a. Éxito → cerrar el issue ──────────────────────────────────────────
+      - name: Cerrar issue (éxito)
+        if: |
+          success() &&
+          github.event_name == 'issues' &&
+          steps.send.outcome == 'success'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: "✅ Podcast generado y enviado a Telegram correctamente."
+            });
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              state: "closed"
+            });
+
+      # ── 5b. Error → comentar en el issue y dejarlo abierto ───────────────────
+      - name: Comentar error en issue (falla)
+        if: |
+          failure() &&
+          github.event_name == 'issues'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `❌ **Error al generar o enviar el podcast.**\n\nRevisa los logs del workflow para más detalles: [Ver run](${runUrl})\n\nPuedes cerrar y reabrir el issue para reintentar, o ejecutar el workflow manualmente desde Actions.`
+            });
